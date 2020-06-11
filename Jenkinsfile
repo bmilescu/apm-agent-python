@@ -37,7 +37,7 @@ pipeline {
     quietPeriod(10)
   }
   triggers {
-    issueCommentTrigger('(?i).*(?:jenkins\\W+)?run\\W+(?:the\\W+)?tests(?:\\W+please)?.*')
+    issueCommentTrigger('(?i).*(?:jenkins\\W+)?run\\W+(?:the\\W+)?(?:(full|benchmark)\\W+)?tests(?:\\W+please)?.*')
   }
   parameters {
     booleanParam(name: 'Run_As_Master_Branch', defaultValue: false, description: 'Allow to run any steps on a PR, some steps normally only run on master branch.')
@@ -61,14 +61,23 @@ pipeline {
             deleteDir()
             gitCheckout(basedir: "${BASE_DIR}", githubNotifyFirstTimeContributor: true)
             stash allowEmpty: true, name: 'source', useDefaultExcludes: false
+            script {
+              dir("${BASE_DIR}"){
+                // Skip all the stages except docs for PR's with asciidoc and md changes only
+                env.ONLY_DOCS = isGitRegionMatch(patterns: [ '.*\\.(asciidoc|md)' ], shouldMatchAll: true)
+              }
+            }
           }
         }
         stage('Sanity checks') {
           when {
             beforeAgent true
-            anyOf {
-              not { changeRequest() }
-              expression { return params.Run_As_Master_Branch }
+            allOf {
+              expression { return env.ONLY_DOCS == "false" }
+              anyOf {
+                not { changeRequest() }
+                expression { return params.Run_As_Master_Branch }
+              }
             }
           }
           steps {
@@ -95,7 +104,10 @@ pipeline {
       options { skipDefaultCheckout() }
       when {
         beforeAgent true
-        expression { return params.tests_ci }
+        allOf {
+          expression { return env.ONLY_DOCS == "false" }
+          expression { return params.tests_ci }
+        }
       }
       steps {
         withGithubNotify(context: 'Test', tab: 'tests') {
@@ -103,11 +115,17 @@ pipeline {
           unstash "source"
           dir("${BASE_DIR}"){
             script {
+              // To enable the full test matrix upon GitHub PR comments
+              def frameworkFile = '.ci/.jenkins_framework.yml'
+              if (env.GITHUB_COMMENT?.contains('full tests')) {
+                log(level: 'INFO', text: 'Full test matrix has been enabled.')
+                frameworkFile = '.ci/.jenkins_framework_full.yml'
+              }
               pythonTasksGen = new PythonParallelTaskGenerator(
                 xKey: 'PYTHON_VERSION',
                 yKey: 'FRAMEWORK',
                 xFile: ".ci/.jenkins_python.yml",
-                yFile: ".ci/.jenkins_framework.yml",
+                yFile: frameworkFile,
                 exclusionFile: ".ci/.jenkins_exclude.yml",
                 tag: "Python",
                 name: "Python",
@@ -125,6 +143,12 @@ pipeline {
           }
         }
       }
+      post {
+        always {
+          convergeCoverage()
+          generateResultsReport()
+        }
+      }
     }
     stage('Building packages') {
       options { skipDefaultCheckout() }
@@ -133,7 +157,10 @@ pipeline {
       }
       when {
         beforeAgent true
-        expression { return params.package_ci }
+        allOf {
+          expression { return env.ONLY_DOCS == "false" }
+          expression { return params.package_ci }
+        }
       }
       steps {
         withGithubNotify(context: 'Building packages') {
@@ -152,9 +179,12 @@ pipeline {
       agent none
       when {
         beforeAgent true
-        anyOf {
-          changeRequest()
-          expression { return !params.Run_As_Master_Branch }
+        allOf {
+          expression { return env.ONLY_DOCS == "false" }
+          anyOf {
+            changeRequest()
+            expression { return !params.Run_As_Master_Branch }
+          }
         }
       }
       steps {
@@ -182,6 +212,7 @@ pipeline {
           anyOf {
             branch 'master'
             expression { return params.Run_As_Master_Branch }
+            expression { return env.GITHUB_COMMENT?.contains('benchmark tests') }
           }
           expression { return params.bench_ci }
         }
@@ -281,28 +312,6 @@ pipeline {
   }
   post {
     cleanup {
-      // Coverage
-      sh script: 'pip3 install --user coverage', label: "Installing coverage"
-      dir("${BASE_DIR}"){
-        script {
-          def matrixDump = pythonTasksGen.dumpMatrix("-")
-          for(vector in matrixDump) {
-            unstash("coverage-${vector}")
-          }
-          sh('python3 -m coverage combine && python3 -m coverage xml')
-          cobertura coberturaReportFile: 'coverage.xml'
-        }
-      }
-      // Results
-      script{
-        if(pythonTasksGen?.results){
-          writeJSON(file: 'results.json', json: toJSON(pythonTasksGen.results), pretty: 2)
-          def mapResults = ["${params.agent_integration_test}": pythonTasksGen.results]
-          def processor = new ResultsProcessor()
-          processor.processResults(mapResults)
-          archiveArtifacts allowEmptyArchive: true, artifacts: 'results.json,results.html', defaultExcludes: false
-        }
-      }
       notifyBuildResult()
     }
   }
@@ -359,27 +368,11 @@ class PythonParallelTaskGenerator extends DefaultParallelTaskGenerator {
             saveResult(x, y, 0)
             steps.error("${label} tests failed : ${e.toString()}\n")
           } finally {
-            steps.junit(allowEmptyResults: true,
-              keepLongStdio: true,
-              testResults: "**/python-agent-junit.xml,**/target/**/TEST-*.xml"
-            )
-            steps.dir("${steps.env.BASE_DIR}/tests"){
-              steps.archiveArtifacts(
-                allowEmptyArchive: true,
-                artifacts: '**/docker-info/**',
-                defaultExcludes: false
-              )
-            }
-            // steps.env.PYTHON_VERSION = "${x}"
-            // steps.env.WEBFRAMEWORK = "${y}"
             steps.dir("${steps.env.BASE_DIR}"){
-              steps.script {
-                steps.stash(
-                name: "coverage-${x}-${y}",
-                includes: ".coverage.${x}.${y}",
-                allowEmpty: false
-              )
-             }
+              steps.dockerLogs(step: "${label}", failNever: true)
+              steps.junit(allowEmptyResults: true, keepLongStdio: true,
+                          testResults: "**/python-agent-junit.xml,**/target/**/TEST-*.xml")
+              steps.stash(name: "coverage-${x}-${y}", includes: ".coverage.${x}.${y}", allowEmpty: true)
             }
           }
         }
@@ -445,9 +438,41 @@ def generateStepForWindows(Map v = [:]){
         } finally {
           dir("${BASE_DIR}"){
             junit(allowEmptyResults: true, keepLongStdio: true, testResults: '**/python-agent-junit.xml')
+            stash(name: "coverage-${v.VERSION}-${v.WEBFRAMEWORK}",
+              includes: ".coverage.${v.VERSION}.${v.WEBFRAMEWORK}",
+              allowEmpty: true
+            )
           }
         }
       }
     }
+  }
+}
+
+def convergeCoverage() {
+  sh script: 'pip3 install --user coverage', label: 'Installing coverage'
+  dir("${BASE_DIR}"){
+    def matrixDump = pythonTasksGen.dumpMatrix("-")
+    for(vector in matrixDump) {
+      unstash("coverage-${vector}")
+    }
+    // Windows coverage converge
+    readYaml(file: '.ci/.jenkins_windows.yml')['windows'].each { v ->
+      unstash(
+        name: "coverage-${v.VERSION}-${v.WEBFRAMEWORK}"
+      )
+    }
+    sh('python3 -m coverage combine && python3 -m coverage xml')
+    cobertura coberturaReportFile: 'coverage.xml'
+  }
+}
+
+def generateResultsReport() {
+  if (pythonTasksGen?.results){
+    writeJSON(file: 'results.json', json: toJSON(pythonTasksGen.results), pretty: 2)
+    def mapResults = ["${params.agent_integration_test}": pythonTasksGen.results]
+    def processor = new ResultsProcessor()
+    processor.processResults(mapResults)
+    archiveArtifacts allowEmptyArchive: true, artifacts: 'results.json,results.html', defaultExcludes: false
   }
 }

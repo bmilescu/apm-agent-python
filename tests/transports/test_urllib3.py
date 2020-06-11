@@ -37,7 +37,7 @@ import urllib3.poolmanager
 from urllib3.exceptions import MaxRetryError, TimeoutError
 
 from elasticapm.conf import constants
-from elasticapm.transport.base import TransportException
+from elasticapm.transport.exceptions import TransportException
 from elasticapm.transport.http import Transport
 from elasticapm.utils import compat
 
@@ -47,6 +47,7 @@ except ImportError:
     from urllib import parse as urlparse
 
 
+@pytest.mark.flaky(reruns=3)  # test is flaky on Windows
 def test_send(waiting_httpserver, elasticapm_client):
     waiting_httpserver.serve_content(code=202, content="", headers={"Location": "http://example.com/foo"})
     transport = Transport(waiting_httpserver.url, client=elasticapm_client)
@@ -125,6 +126,12 @@ def test_no_proxy_star():
 
 def test_no_proxy_host():
     with mock.patch.dict("os.environ", {"HTTPS_PROXY": "https://example.com", "NO_PROXY": "localhost"}):
+        transport = Transport("http://localhost:9999", client=None)
+        assert not isinstance(transport.http, urllib3.poolmanager.ProxyManager)
+
+
+def test_no_proxy_all():
+    with mock.patch.dict("os.environ", {"HTTPS_PROXY": "https://example.com", "NO_PROXY": "*"}):
         transport = Transport("http://localhost:9999", client=None)
         assert not isinstance(transport.http, urllib3.poolmanager.ProxyManager)
 
@@ -266,11 +273,18 @@ def test_get_config(waiting_httpserver, elasticapm_client):
         code=200, content=b'{"x": "y"}', headers={"Cache-Control": "max-age=5", "Etag": "2"}
     )
     url = waiting_httpserver.url
-    transport = Transport(url + "/" + constants.EVENTS_API_PATH, client=elasticapm_client)
+    transport = Transport(
+        url + "/" + constants.EVENTS_API_PATH,
+        client=elasticapm_client,
+        headers={"Content-Type": "application/x-ndjson", "Content-Encoding": "gzip"},
+    )
     version, data, max_age = transport.get_config("1", {})
     assert version == "2"
     assert data == {"x": "y"}
     assert max_age == 5
+
+    assert "Content-Encoding" not in waiting_httpserver.requests[0].headers
+    assert waiting_httpserver.requests[0].headers["Content-Type"] == "application/json"
 
 
 @mock.patch("urllib3.poolmanager.PoolManager.urlopen")
